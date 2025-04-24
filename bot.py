@@ -6,6 +6,8 @@ import logging
 from datetime import datetime
 from mvc_checker import get_new_appointments, TYPE_CODES, MVC_LOCATION_CODES
 from config import DISCORD_TOKEN, CHECK_INTERVAL_SECONDS
+import json
+import os
 
 intents = discord.Intents.default()
 intents.message_content = False  # Explicitly false unless message reading is needed
@@ -22,6 +24,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SUBSCRIPTIONS_FILE = "subscriptions.json"
+def load_subscriptions():
+    global subscriptions
+    if os.path.exists(SUBSCRIPTIONS_FILE):
+        try:
+            with open(SUBSCRIPTIONS_FILE, "r") as f:
+                raw = json.load(f)
+                subscriptions.clear()
+                for uid, sublist in raw.items():
+                    subscriptions[int(uid)] = set(tuple(pair) for pair in sublist)
+                logger.info("✅ Subscriptions loaded from JSON.")
+        except Exception as e:
+            logger.exception("❌ Failed to load subscriptions:")
+
+def save_subscriptions():
+    try:
+        serializable = {str(k): list(v) for k, v in subscriptions.items()}
+        with open(SUBSCRIPTIONS_FILE, "w") as f:
+            json.dump(serializable, f, indent=2)
+        logger.info("💾 Subscriptions saved to JSON.")
+    except Exception as e:
+        logger.exception("❌ Failed to save subscriptions:")
+
 class MVCBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="/", intents=intents)
@@ -29,6 +54,7 @@ class MVCBot(commands.Bot):
     async def setup_hook(self):
         await self.tree.sync()
         self.loop.create_task(self.notify_users_loop())
+        load_subscriptions()
         logger.info("✅ Slash commands synced and background task started")
 
     async def notify_users_loop(self):
@@ -68,32 +94,20 @@ class MVCBot(commands.Bot):
                             if not url.startswith("https://"):
                                 logger.warning(f"⚠️ Invalid URL skipped: {url}")
                                 continue
-                            prefix = "🟢 EARLIEST AVAILABLE" if i == 0 else ""
                             if current_date != date:
                                 current_date = date
                                 embed.add_field(name=f"📅 {date}", value="\u200b", inline=False)
                             embed.add_field(
-                                name=f"{prefix} 🕒 {time}" if prefix else f"🕒 {time}",
+                                name=f"🕒 {time}",
                                 value=f"[Book Slot]({url})",
-                                inline=False
+                                inline=True
                             )
 
                         embed.set_footer(text="NJ MVC Appointment Bot")
                         embed.timestamp = discord.utils.utcnow()
 
                         try:
-                            dm_channel = user.dm_channel or await user.create_dm()
-                            messages_to_delete = []
-                            async for msg in dm_channel.history(limit=50):
-                                if msg.author == self.user:
-                                    messages_to_delete.append(msg)
-                            new_message = await user.send(embed=embed)
-                            for msg in messages_to_delete:
-                                if msg.id != new_message.id:
-                                    try:
-                                        await msg.delete()
-                                    except Exception:
-                                        pass
+                            await user.send(embed=embed)
                         except discord.Forbidden:
                             logger.warning(f"❌ Cannot DM user {user_id}")
             except Exception as e:
@@ -136,6 +150,7 @@ async def clear_all(interaction: discord.Interaction):
     if user_id in subscriptions:
         subscriptions[user_id].clear()
         await interaction.response.send_message("🧹 All your subscriptions have been cleared.", ephemeral=True)
+        save_subscriptions()
     else:
         await interaction.response.send_message("You had no subscriptions to clear.", ephemeral=True)
 
@@ -210,7 +225,7 @@ class ConfirmButton(Button):
         user_id = interaction.user.id
         for loc in self.parent.selected_location:
             subscriptions.setdefault(user_id, set()).add((self.parent.selected_type, loc))
-
+        save_subscriptions()
         loc_list = ', '.join(f"**{loc}**" for loc in self.parent.selected_location)
         embed = discord.Embed(
             title="✅ Subscription Confirmed!",
@@ -218,6 +233,7 @@ class ConfirmButton(Button):
             color=0x2ecc71
         )
         await interaction.response.edit_message(content=None, embed=embed, view=None)
+
 class UnsubscribeView(discord.ui.View):
     def __init__(self, user_id, subs):
         super().__init__(timeout=60)
@@ -268,9 +284,11 @@ class UnsubscribeConfirmButton(discord.ui.Button):
         user_id = self.parent.user_id
         for t, l in self.parent.selected:
             subscriptions[user_id].discard((t, l))
+            save_subscriptions()
 
         if not subscriptions[user_id]:
             subscriptions.pop(user_id)
+            save_subscriptions()
             await interaction.response.edit_message(
                 content="🧹 All your subscriptions have been removed.",
                 view=None
